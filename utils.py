@@ -24,7 +24,7 @@ def extract_tables(db, pdf):
         ]
     info_pattern = r"SEAT NO:\s(\w+)\sNAME\s:\s([A-Z]+\s[A-Z]+\s[A-Z]+)"
 
-    row_pattern = r"^(\d+[A-Z]?)\s+([A-Z &]+)\s+(\d+|---)\s+(\d+|---)\s+(\d+|---)\s+(\d+|---)\s+(\d+|---)\s+(\d+|---)\s+(\d+|---)\s+(\d+|---)\s+(\d{2})\s+([A-Z+]+)\s+(\d{2})\s+(\d{2})\s+(---|\d+)\s+(---|\d+)$"
+    row_pattern = r"^(\d+[A-Z]?)\s+([A-Z: &]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z+]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(---|\d+|[A-Z]+)\s+(---|\d+|[A-Z]+)$"
 
     info = ()
     for page in pdf.pages:
@@ -36,29 +36,44 @@ def extract_tables(db, pdf):
         for line in data.splitlines():
             _match = re.match(row_pattern, line)
             if _match:
-                record = info + _match.groups()
+                record = info + tuple(val.strip() for val in _match.groups())
                 add_record(db, record)
                 continue
 
             _match = re.search(info_pattern, line)
             if _match:
-                info = _match.groups()
+                info = tuple(val.strip() for val in _match.groups())
                 continue
 
-            print(line)
 
+def export(file: str, db, *queries):
+    data = list()
 
-def export_to_docx(file: str, columns_data: list[list]):
+    data.append(list(ele.values() for ele in db.query(f"SELECT DISTINCT seat_no FROM {TABLE_NAME}")))
+    data.append(list(ele.values() for ele in db.query(f"SELECT DISTINCT name FROM {TABLE_NAME}")))
+
+    for key, column in queries:
+        data.append(list(ele.values() for ele in db[TABLE_NAME].rows_where(f"course_name = ? AND {column} != '---'", [key], select=column)))
+
     doc = Document()
 
-    rlen = len(columns_data[0])
-    clen = len(columns_data)
+    rlen = len(data[0])
+    clen = len(data)
 
     table = doc.add_table(rows=rlen, cols=clen)
+    
+    table.cell(0, 0).text = 'SEAT NO'
+    table.cell(0, 0).paragraphs[0].runs[0].bold = True
+    table.cell(0, 1).text = 'NAME'
+    table.cell(0, 1).paragraphs[0].runs[0].bold = True
 
-    for cindex in range(clen):
-        for rindex in range(rlen):
-            table.cell(rindex, cindex).text = columns_data[cindex][rindex]
+    for i, ele in enumerate(queries, 2):
+        table.cell(0, i).text = f'{ele[0]} ({ele[1]})'
+        table.cell(0, i).paragraphs[0].runs[0].bold = True
+
+    for cindex in range(0, clen):
+        for rindex in range(1, rlen):
+            table.cell(rindex, cindex).text = data[cindex][rindex]
 
     doc.save(file)
 
@@ -70,6 +85,8 @@ def generate_database_name(length=12):
 
 def init_db():
     db_path = os.path.join(TEMP_DB_DIR, generate_database_name())
+    os.makedirs(TEMP_DB_DIR, exist_ok=True)
+    
     db = Database(db_path)
     
     db[TABLE_NAME].create({
@@ -96,6 +113,7 @@ def init_db():
 
     return db
 
+
 def add_record(db, record):
     db[TABLE_NAME].insert({
         'seat_no': record[0],
@@ -120,11 +138,15 @@ def add_record(db, record):
 
 
 if __name__ == '__main__':
-    pdf = read_pdf('sample.pdf')
-    db = init_db()
-    try:
-        extract_tables(db, pdf)
-    except Exception as e:
-        print(e)
-        pdf.close()
-        db.close()
+    # pdf = read_pdf('sample.pdf')
+    # db = init_db()
+    # try:
+    #     extract_tables(db, pdf)
+    #     db.close()
+    #     pdf.close()
+    # except Exception as e:
+    #     print(e)
+    #     pdf.close()
+    #     db.close()
+
+    export('sample.docx', Database('database/temp_9395fcb3de5e.db'), ('ENGINEERING MATHEMATICS III', 'ise'), ('DATA STUCTURES LABORATORY', 'tw'))
