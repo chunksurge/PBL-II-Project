@@ -5,26 +5,30 @@ from sqlite_utils import Database
 import uuid
 import os
 import logging
+from collections import defaultdict
 
-TEMP_DB_DIR = 'database'
+TEMP_DB_DIR = 'temp/database'
+TEMP_DOCX_DIR = 'temp/docx'
+
+os.makedirs(TEMP_DB_DIR, exist_ok=True)
+os.makedirs(TEMP_DOCX_DIR, exist_ok=True)
+
 TABLE_NAME = 'score'
+COLUMNS = ['seat_no', 'name', 'course_id', 'course_name', 'ise', 'ese', 'total', 'tw', 'pr', '_or', 'tut', 'tot', 'crd', 'grd', 'gp', 'cp']
 
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 
-def read_pdf(file) -> pdfplumber.PDF:
-    pdf = pdfplumber.open(file, raise_unicode_errors=False)
-    return pdf
+def extract_tables(db: Database, pdf_path: str):
+    pdf = pdfplumber.open(pdf_path)
 
-
-def extract_tables(db, pdf):
     filters = [
             r"#|\$|\*|\(|\)|\[|\]|%|\.|\,|/\d\d\d",
             r"COURSE NAME ISE ESE TOTAL TW PR OR TUT Tot Crd Grd GP CP P&R ORD"
         ]
     info_pattern = r"SEAT NO:\s(\w+)\sNAME\s:\s([A-Z]+\s[A-Z]+\s[A-Z]+)"
 
-    row_pattern = r"^(\d+[A-Z]?)\s+([A-Z: &]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z+]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(---|\d+|[A-Z]+)\s+(---|\d+|[A-Z]+)$"
+    row_pattern = r"^(\d+[A-Z]?)\s+([A-Z: &]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z+]+)\s+(\d+|---|[A-Z]+)\s+(\d+|---|[A-Z]+)"
 
     info = ()
     for page in pdf.pages:
@@ -34,119 +38,91 @@ def extract_tables(db, pdf):
             data = re.sub(filter, '', data)
         
         for line in data.splitlines():
-            _match = re.match(row_pattern, line)
-            if _match:
-                record = info + tuple(val.strip() for val in _match.groups())
+            if _match := re.match(row_pattern, line):
+                record = info + tuple(val.strip() if val.strip() != '---' else None for val in _match.groups())
                 add_record(db, record)
-                continue
-
-            _match = re.search(info_pattern, line)
-            if _match:
+            
+            elif _match := re.search(info_pattern, line):
                 info = tuple(val.strip() for val in _match.groups())
-                continue
+        break
+    pdf.close()
 
 
-def export(file: str, db, *queries):
-    data = list()
-
-    data.append(list(ele.values() for ele in db.query(f"SELECT DISTINCT seat_no FROM {TABLE_NAME}")))
-    data.append(list(ele.values() for ele in db.query(f"SELECT DISTINCT name FROM {TABLE_NAME}")))
-
-    for key, column in queries:
-        data.append(list(ele.values() for ele in db[TABLE_NAME].rows_where(f"course_name = ? AND {column} != '---'", [key], select=column)))
-
+def export(file_path: str, db: Database, queries: list[tuple[str, str]]):
     doc = Document()
 
-    rlen = len(data[0])
-    clen = len(data)
+    seat_no_column = db.query(f"SELECT DISTINCT seat_no FROM {TABLE_NAME}")
+    name_column = db.query(f"SELECT DISTINCT name FROM {TABLE_NAME}")
 
-    table = doc.add_table(rows=rlen, cols=clen)
-    
+    table = doc.add_table(rows=1, cols=len(queries) + 2)
     table.cell(0, 0).text = 'SEAT NO'
     table.cell(0, 0).paragraphs[0].runs[0].bold = True
     table.cell(0, 1).text = 'NAME'
     table.cell(0, 1).paragraphs[0].runs[0].bold = True
+    
+    for i, (seat_no, name) in enumerate(zip(seat_no_column, name_column), 1):
+        table.add_row().cells[0].text = seat_no['seat_no']
+        table.cell(i, 1).text = name['name']
+    
+    # Build a mapping from seat_no to table row for quick lookup.
+    seatno_row_map = { row.cells[0].text: row for row in table.rows[1:] }
 
-    for i, ele in enumerate(queries, 2):
-        table.cell(0, i).text = f'{ele[0]} ({ele[1]})'
+    # Process each query and update the corresponding column in the table.
+    for i, (couse_name, column) in enumerate(queries, 2):
+        table.cell(0, i).text = f'{couse_name} ({column})'
         table.cell(0, i).paragraphs[0].runs[0].bold = True
 
-    for cindex in range(0, clen):
-        for rindex in range(1, rlen):
-            table.cell(rindex, cindex).text = data[cindex][rindex]
+        q = f"SELECT seat_no, {column} FROM {TABLE_NAME} WHERE course_name = '{couse_name}' AND {column} != '---'"
+        values = db.execute(q)
 
-    doc.save(file)
+        for seat_no, value in values:
+            if seat_no in seatno_row_map:
+                seatno_row_map[seat_no].cells[i].text = value
+
+    doc.save(file_path)
 
 
-def generate_database_name(length=12):
+def generate_temp_name(ext: str, length=12):
     # uuid4().hex returns a 32-character hexadecimal string (0-9, a-f)
-    return f'temp_{uuid.uuid4().hex[:length]}.db'
+    return f'temp_{uuid.uuid4().hex[:length]}.{ext}'
 
 
-def init_db():
-    db_path = os.path.join(TEMP_DB_DIR, generate_database_name())
-    os.makedirs(TEMP_DB_DIR, exist_ok=True)
+def init_db(file_path: str):
+    db = Database(file_path)
     
-    db = Database(db_path)
-    
-    db[TABLE_NAME].create({
-            "id": int,
-            'seat_no': str,
-            'name': str,
-            'course_id': str,
-            'course_name': str,
-            'ise': str,
-            'ese': str,
-            'total': str,
-            'tw': str,
-            'pr': str,
-            'or': str,
-            'tut': str,
-            'tot': str,
-            'crd': str,
-            'grd': str,
-            'gp': str,
-            'cp': str,
-            'par': str,
-            'ord': str
-        }, pk="id")
+    columns = { "id": int } | {col: str for col in COLUMNS}
+    db[TABLE_NAME].create(columns , pk="id")
 
     return db
 
 
-def add_record(db, record):
-    db[TABLE_NAME].insert({
-        'seat_no': record[0],
-        'name': record[1],
-        'course_id': record[2],
-        'course_name': record[3],
-        'ise': record[4],
-        'ese': record[5],
-        'total': record[6],
-        'tw': record[7],
-        'pr': record[8],
-        'or': record[9],
-        'tut': record[10],
-        'tot': record[11],
-        'crd': record[12],
-        'grd': record[13],
-        'gp': record[14],
-        'cp': record[15],
-        'par': record[16],
-        'ord': record[17]
-    })
+def add_record(db: Database, record: tuple[str]):
+    record = {col: val for col, val in zip(COLUMNS, record)}
+    db[TABLE_NAME].insert(record)
 
 
-if __name__ == '__main__':
-    # pdf = read_pdf('sample.pdf')
-    # db = init_db()
-    # try:
-    #     extract_tables(db, pdf)
-    #     db.close()
-    #     pdf.close()
-    # except Exception as e:
-    #     print(e)
-    #     pdf.close()
-    #     db.close()
+def get_course_names(db: Database):
+    result = defaultdict(list)
 
-    export('sample.docx', Database('database/temp_9395fcb3de5e.db'), ('ENGINEERING MATHEMATICS III', 'ise'), ('DATA STUCTURES LABORATORY', 'tw'))
+    course_names = list(course['course_name'] for course in db.query('SELECT DISTINCT course_name FROM score'))
+    for name in course_names:
+        for column in COLUMNS[4:]:
+            has_null = db[TABLE_NAME].count_where(f"{column} IS NULL AND course_name = '{name}'") > 0
+            if not has_null:
+                result[name].append(column)
+    
+    return result
+
+
+# if __name__ == '__main__':
+    # db = init_db(os.path.join(TEMP_DB_DIR, generate_temp_name('db')))
+    # extract_tables(db, 'scrap/sample.pdf')
+    # db.close()
+
+    # export('sample.docx', Database('database/temp_6f16e23d77b3.db'), ('ENGINEERING MATHEMATICS III', 'ise'), ('DATA STUCTURES LABORATORY', 'tw'), ('SMART CITIES', 'tot'))
+
+    # courses = get_course_names(Database('temp/database/temp_98acca113ba2.db'))
+    # for course, val in courses.items():
+    #     print(course, *val)
+
+    # pass
