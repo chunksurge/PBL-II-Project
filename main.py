@@ -1,6 +1,6 @@
 import sys
 
-from PySide6.QtWidgets import  QApplication, QMainWindow, QFileDialog, QCheckBox, QFrame, QHBoxLayout, QLabel, QWidget, QMessageBox
+from PySide6.QtWidgets import  QApplication, QMainWindow, QFileDialog, QCheckBox, QFrame, QHBoxLayout, QLabel, QWidget, QMessageBox, QProgressBar
 from PySide6.QtCore import QThread, QObject, Signal
 
 from app import Ui_MainWindow
@@ -20,36 +20,47 @@ class Worker(QObject):
         self.args = args
     
     def export_file_data(self):
-        utils.export_to_docx(*self.args)
+        utils.export_to_docx(*self.args, progress_callback=self.progress.emit)
         self.finished.emit({})
 
     def process_file(self):
-        parser = utils.pdf_parser(*self.args, utils.pdf_filters, utils.pdf_patterns, utils.pdf_substitutions)
-
         result = defaultdict(dict)
         name = None
+
+        def add_to_result(key, value):
+            if key == 'name':
+                nonlocal name
+                name = value
+            elif key == 'course':
+                course = value[1]
+                result[name][course] = {key: value for key, value in zip(utils.SCORE_TYPES, value[2:])}
         
-        for progress, data in parser:
-            if progress == 100:
-                self.progress.emit(100)
-                self.finished.emit(result)
-                return
-
-            if data:
-                if 'name' in data:
-                    name = data['name']
-                
-                elif 'course' in data:
-                    course = data['course'][1]
-                    result[name][course] = {key: value for key, value in zip(utils.SCORE_TYPES, data['course'][2:])}
-
-            self.progress.emit(progress)
+        utils.pdf_parser(*self.args, utils.PDF_FILTERS, utils.PDF_PATTERNS, utils.PDF_SUBSTITUTIONS, add_to_result, progress_callback=self.progress.emit)
+        
+        self.progress.emit(100)
+        self.finished.emit(result)
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+
+        self.ui.status_container = QWidget()
+        self.ui.status_container_layout = QHBoxLayout(self.ui.status_container)
+        self.ui.status_container_layout.setContentsMargins(9, 0, 9, 0) 
+        self.ui.status_container_layout.setSpacing(8)
+
+        self.ui.statustext = QLabel()
+        self.ui.statustext.setObjectName(u"statustext")
+        self.ui.statustext.setText('')
+        self.ui.status_container_layout.addWidget(self.ui.statustext)
+        
+        self.ui.progress_bar = QProgressBar()
+        self.ui.progress_bar.setObjectName(u"progress_bar")
+        self.ui.status_container_layout.addWidget(self.ui.progress_bar)
+
+        self.ui.statusbar.addWidget(self.ui.status_container, 1)
 
         self.ui.file_name.setText('No file selected')
         self.ui.process_pdf_btn.setEnabled(False)
@@ -61,10 +72,14 @@ class MainWindow(QMainWindow):
         self.ui.export_as_docx_btn.clicked.connect(self.export_file_data)
 
         self.file_path = None
-        self.prev_progress = 0
-
-        self.resize(405, 215)
+        self.progress = 0
     
+    def set_status(self, text):
+        self.ui.statustext.setText(text)
+    
+    def clear_status(self):
+        self.ui.statustext.setText('')
+
     def show_error(self, message, submessage=None):
         error_box = QMessageBox(self)
         error_box.setWindowTitle("Error")
@@ -86,6 +101,7 @@ class MainWindow(QMainWindow):
             self.file_path = file_path
 
             self.ui.course_select_widget.hide()
+            self.ui.instructions_label.show()
 
             while self.ui.verticalLayout_11.count():
                 child = self.ui.verticalLayout_11.takeAt(0)
@@ -95,14 +111,13 @@ class MainWindow(QMainWindow):
             self.ui.process_pdf_btn.setEnabled(True)
 
     def process_file(self):
-        self.prev_progress = 0
-        self.ui.progress_bar.show()
+        self.progress = 0
         self.ui.progress_bar.setValue(0)
+        self.ui.progress_bar.show()
+        self.set_status('Processing...')
         self.ui.select_file_btn.setEnabled(False)
         self.ui.export_as_docx_btn.setEnabled(False)
         self.ui.process_pdf_btn.setEnabled(False)
-
-        self.ui.process_pdf_btn.setText('Processing...')
         
         self.thread = QThread()
         self.worker = Worker(self.file_path)
@@ -118,30 +133,31 @@ class MainWindow(QMainWindow):
         self.thread.start()
     
     def update_progress(self, progress):
-        progress = int(progress)
-        if progress > self.prev_progress:
-            self.prev_progress = progress
-            self.ui.progress_bar.setValue(progress)
+        if progress > self.progress:
+            self.progress = progress
+            self.ui.progress_bar.setValue(self.progress)
 
     def process_file_done(self, result):
         if not result:
             self.ui.file_name.setText('No file selected')
             self.ui.process_pdf_btn.setEnabled(False)
-            self.ui.progress_bar.setValue(0)
             self.ui.progress_bar.hide()
-            self.prev_progress = 0
+            self.clear_status()
+            self.ui.course_select_widget.hide()
+            self.ui.instructions_label.show()
             self.ui.select_file_btn.setEnabled(True)
-            self.ui.process_pdf_btn.setText('Start processing')
             self.show_error('Failed to process file!', 'Possible reasons:\n- PDF file does not contain any data\n- PDF File format is not supported\n- PDF file does not exist')
             return
 
+        self.ui.instructions_label.hide()
         self.result = result
         self.ui.progress_bar.hide()
+        self.clear_status()
         self.show_selected_courses()
         self.ui.course_select_widget.show()
         self.ui.select_file_btn.setEnabled(True)
         self.ui.export_as_docx_btn.setEnabled(True)
-        self.ui.process_pdf_btn.setText('Start processing')
+        self.ui.process_pdf_btn.setEnabled(False)
         self.adjustSize()
     
     def show_selected_courses(self):        
@@ -191,6 +207,10 @@ class MainWindow(QMainWindow):
         )
 
         if file_path:
+            self.progress = 0
+            self.ui.progress_bar.setValue(0)
+            self.ui.progress_bar.show()
+            self.set_status('Exporting...')
             self.ui.select_file_btn.setEnabled(False)
             self.ui.export_as_docx_btn.setEnabled(False)
 
@@ -202,11 +222,14 @@ class MainWindow(QMainWindow):
             self.worker.finished.connect(self.export_file_data_done)
             self.worker.finished.connect(self.thread.quit)
             self.worker.finished.connect(self.worker.deleteLater)
+            self.worker.progress.connect(self.update_progress)
             self.thread.finished.connect(self.thread.deleteLater)
 
             self.thread.start()
     
     def export_file_data_done(self):
+        self.ui.progress_bar.hide()
+        self.clear_status()
         self.ui.select_file_btn.setEnabled(True)
         self.ui.export_as_docx_btn.setEnabled(True)
 
